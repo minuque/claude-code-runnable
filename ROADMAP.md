@@ -259,6 +259,30 @@ BashTool 类 (extends Tool)
 
 **三层架构**：`用户输入` → `commands.ts`(/command) → `SkillTool`(SKILL.md) → `MCP`(动态 skills)
 
+### 4.1 `loadSkillsDir.ts` 函数调用路线
+
+```
+getSkillDirCommands() — memoized, **入口**
+  ├─ loadSkillsFromSkillsDir()                    // 扫描 .claude/skills/ + 全局 skills
+  │    ├─ discoverSkillDirsForPaths()             // 递归发现 skill 目录
+  │    ├─ getFileIdentity(filePath)               // 文件指纹(防重复加载)
+  │    ├─ parseSkillFrontmatterFields()           // 解析 SKILL.md frontmatter
+  │    │    └─ 提取: name, description, model, tools, hooks, args...
+  │    ├─ createSkillCommand({...})               // Skill → Command 对象封装
+  │    │    ├─ estimateSkillFrontmatterTokens()   // 估算 token 开销
+  │    │    ├─ substituteArguments()              // 参数替换($ARGUMENTS)
+  │    │    └─ 构建 prompt/schema/回调
+  │    └─ 按权限模式过滤 (userSettings/projectSettings/plugin)
+  ├─ loadSkillsFromCommandsDir()                  // 扫描内部 commands 目录
+  ├─ addSkillDirectories()                        // 动态添加 skill 目录
+  └─ activateConditionalSkillsForPaths()          // 条件 skills 激活
+
+辅助函数:
+  clearSkillCaches()          — 清除缓存(配置变更时)
+  getDynamicSkills()          — 获取动态加载的 skills
+  onDynamicSkillsLoaded()     — 注册 skills 加载完成回调
+```
+
 > **前置知识**
 > - 第三阶段（SkillTool 是 Tool 子类）
 > - Markdown frontmatter 解析（YAML）
@@ -385,6 +409,39 @@ runAgent({...}) — async generator, 子 Agent 生命周期
 
 > 其余 Task 类型（LocalWorkflowTask、InProcessTeammateTask、RemoteAgentTask、DreamTask、MonitorMcpTask）及 UI 组件，在核心理解后按需翻阅。
 
+### 6B.3 `LocalAgentTask.tsx` 任务生命周期
+
+```
+registerAsyncAgent({taskId, agentDefinition, ...})   // **创建任务**
+  ├─ 构建 LocalAgentTaskState (status: 'pending')
+  ├─ 注册到 appState.tasks[taskId]
+  └─ 启动异步 runAgent() → query 循环
+
+registerAgentForeground({taskId, ...})                // **前台注册**
+  └─ 注册 foreground task + 渲染 AgentProgressLine UI
+
+[任务状态转换]
+  pending ──→ running ──→ completed
+                      ├─→ failed
+                      └─→ killed (killAsyncAgent)
+
+[进度追踪]
+  updateProgressFromMessage()    // 从消息推断进度
+    └─ getProgressUpdate()       // 生成 AgentProgress 结构
+      └─ updateAgentProgress()   // 写回 appState
+
+[消息投递]
+  queuePendingMessage(taskId, msg)    // 排队消息(agent 忙碌时)
+  appendMessageToLocalAgent(taskId)   // 追加到 agent 消息队列
+  drainPendingMessages(taskId)        // agent 空闲时消费队列
+
+[生命周期收尾]
+  completeAgentTask(result)     // 正常完成 → 更新摘要
+  failAgentTask(taskId, error)  // 异常 → 记录错误
+  backgroundAgentTask(taskId)   // 长期运行 → 转入后台
+  unregisterAgentForeground()   // 清理前台状态
+```
+
 ---
 
 ## 第七阶段：异步邮箱 & 团队协调
@@ -398,6 +455,31 @@ runAgent({...}) — async generator, 子 Agent 生命周期
 | 7.4 | `src/context/mailbox.tsx` | 邮箱 React Context |
 | 7.5 | `src/hooks/useMailboxBridge.ts` | 邮箱 ↔ UI 桥接 |
 | 7.6 | `src/hooks/useSwarmInitialization.ts` | Swarm 批量 agent 启动 |
+
+### 7.3 `SendMessageTool.ts` 消息路由决策树
+
+```
+SendMessageTool.call(input: {to, message, summary})
+  ├─ [1] 地址解析 parseAddress(input.to)
+  │    ├─ scheme === 'bridge'  → postInterClaudeMessage()    // 远程 bridge 投递
+  │    └─ scheme === 'uds'     → sendToUdsSocket()           // Unix domain socket
+  │
+  ├─ [2] Agent 名称/ID 解析
+  │    ├─ agentNameRegistry.get(input.to)                    // 注册名查找
+  │    └─ toAgentId(input.to)                                // raw ID 解析
+  │
+  ├─ [3] Agent 状态路由
+  │    ├─ status === 'running'
+  │    │    └─ queuePendingMessage(agentId, msg)             // 排队等待下轮
+  │    ├─ status === 'stopped'/'completed'/'failed'
+  │    │    └─ resumeAgentBackground({agentId, prompt})      // 自动恢复
+  │    └─ task 不在 state (可能已归档)
+  │         └─ resumeAgentBackground() 从 transcript 恢复
+  │
+  └─ [4] 其他接收者 (通过 mailbox React Context)
+       ├─ 推送到 mailbox 队列
+       └─ useMailboxBridge 桥接到 UI
+```
 
 > **前置知识**
 > - 第六阶段（Team/Agent 依赖 AgentTool 派生能力）
@@ -420,6 +502,30 @@ runAgent({...}) — async generator, 子 Agent 生命周期
 | 8.6 | `src/bridge/createSession.ts` + `peerSessions.ts` | 子会话创建 & 对等会话管理 |
 
 > 其余 bridge 文件（envLessBridgeConfig、capacityWake、bridgeApi、bridgeConfig、bridgeEnabled、codeSessionApi、replBridge、webhookSanitizer）是具体配置/辅助，通读核心 6 个后按需翻阅。
+
+### 8.1 `EnterWorktreeTool` 工作流程
+
+```
+EnterWorktreeTool.call(input: {path, reset, branch, ...})
+  ├─ [1] 创建 git worktree
+  │    ├─ git worktree add <path> --detach            // 创建隔离目录
+  │    └─ 检查/重置分支 (--reset 强制重建)
+  ├─ [2] 环境隔离
+  │    ├─ 设置 worktree 内的 CWD
+  │    ├─ 继承/过滤父进程环境变量
+  │    └─ 共享 .git 目录(对象库共享，节省空间)
+  ├─ [3] Bridge 子会话创建
+  │    ├─ createSessionSpawner()  → sessionRunner.ts
+  │    ├─ spawn(worktreePath)      // 在新 worktree 中启动 CLI 子进程
+  │    └─ 建立 IPC 通信(stdin/stdout JSON 行协议)
+  └─ [4] 返回 worktree 信息给 AgentTool
+       └─ runAgent({worktreePath, ...})  // agent 在隔离环境执行
+
+ExitWorktreeTool.call(input)
+  ├─ git merge <worktree-branch>                    // 合并分支结果
+  ├─ git worktree remove <path> --force             // 删除 worktree
+  └─ git branch -D <worktree-branch>                // 清理分支
+```
 
 ### 8.3 `sessionRunner.ts` 子进程生命周期
 
@@ -601,6 +707,31 @@ useCanUseTool(setToolUseConfirmQueue, setToolPermissionContext)
 | `src/memdir/paths.ts` | 记忆路径解析（auto memory dir、team memory dir） |
 | `src/memdir/findRelevantMemories.ts` | 相关记忆检索 |
 | `src/memdir/memoryAge.ts` | 记忆年龄 & 衰减策略 |
+
+### 10G `memdir/memdir.ts` 记忆加载流程
+
+```
+loadMemoryPrompt() — 每次 query 轮次前调用
+  ├─ getAutoMemPath() → 解析 ~/.claude/projects/<hash>/memory/
+  ├─ ensureMemoryDirExists()                          // 确保目录存在
+  ├─ [1] 加载 MEMORY.md 入口文件
+  │    ├─ 读取 <memoryDir>/MEMORY.md
+  │    ├─ truncateEntrypointContent()                 // 截断超长/超大内容
+  │    │    └─ 限制: MAX_ENTRYPOINT_LINES(200) / MAX_ENTRYPOINT_BYTES(25KB)
+  │    └─ 解析 entrypoints: [file1.md, file2.md, ...]
+  ├─ [2] 构建记忆分层 prompt
+  │    └─ buildMemoryPrompt({entrypoint, memoryDir})
+  │         ├─ buildMemoryLines()                     // 逐文件读取内容
+  │         │    ├─ 解析每个 .md 文件的 frontmatter
+  │         │    │    └─ 提取: name, description, type, metadata
+  │         │    └─ 按类型分组(user/feedback/project/reference)
+  │         ├─ findRelevantMemories()                 // 检索相关记忆
+  │         │    └─ memoryAge 衰减策略(新鲜记忆优先级高)
+  │         └─ buildSearchingPastContextSection()     // 生成搜索指引
+  ├─ [3] 加载嵌套记忆 (loadedNestedMemoryPaths)
+  │    └─ 递归解析 MEMORY.md 中 [[wikilink]] 引用
+  └─ 返回完整记忆 prompt 字符串 → 注入 system prompt
+```
 
 ### 10H: 成本 & 遥测
 
