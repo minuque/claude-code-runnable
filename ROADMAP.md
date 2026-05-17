@@ -67,6 +67,48 @@ graph TD
 | 1.5 | `src/utils/config.ts` | 配置读写（globalConfig / projectConfig / localConfig），设置分层优先级 |
 | 1.6 | `src/utils/settings/` | Settings 完整实现：分层读取、缓存、变更检测 |
 
+### 1.1 `main.tsx` 启动调用链
+
+```
+main()
+  ├─ startMdmRawRead()              // MDM 子进程预启动(并行)
+  ├─ startKeychainPrefetch()        // Keychain OAuth token 预取(并行)
+  ├─ init()                         // 单例初始化 → entrypoints/init.ts
+  │    ├─ 配置加载 (userSettings → projectSettings → localSettings)
+  │    ├─ OAuth/API Key 认证
+  │    ├─ OpenTelemetry 初始化
+  │    ├─ GrowthBook 特性标记拉取
+  │    ├─ policyLimits 加载
+  │    └─ MCP 预连接
+  ├─ Commander 参数解析             // --model, --fast, --agent, --resume...
+  ├─ [快速路径路由]                  // --version, --help, bridge, daemon...
+  ├─ getSystemContext()             // 构建初始 system prompt
+  ├─ getUserContext()               // 构建 user context
+  ├─ getTools()                     // 组装工具注册表
+  ├─ [Ink 渲染挂载]
+  │    └─ <App> → <REPL> 或 <ResumeConversation>
+  └─ [进入 REPL 对话循环]
+```
+
+### 1.4 `context.ts` 系统上下文构建
+
+```
+getSystemContext(mainLoopModel, tools, mcpClients, ...) — memoized
+  └─ 组装多段 system prompt(injection 顺序):
+       ├─ getSystemPromptInjection()     // SDK 注入
+       ├─ CLAUDE.md 内容加载             // 项目/用户指令
+       ├─ Tool 列表生成                  // 每个工具 name+description+schema
+       ├─ Skill 列表注入                 // 已发现的 skills
+       ├─ MCP 指令注入                   // MCP server 提供的 tool
+       ├─ Memory prompt (memdir)         // 持久化记忆
+       ├─ Plan mode 约束                 // plan 模式的额外规则
+       ├─ DEFAULT_AGENT_PROMPT           // 核心行为契约
+       └─ Environment details            // OS/CWD/Git status
+
+getUserContext() — memoized
+  └─ 当前时间、工作目录、Git 状态、平台信息
+```
+
 > **前置知识**
 > - TypeScript 模块解析（ESM / `import`）
 > - Node.js 进程生命周期（`process.env`、`process.cwd`）
@@ -89,6 +131,54 @@ graph TD
 | 2.6 | `src/services/api/` | Anthropic API 客户端：消息流式请求、重试、错误处理、速率限制 |
 | 2.7 | `src/constants/prompts.ts` | **系统提示词**。DEFAULT_AGENT_PROMPT 定义核心行为契约——工具选择、安全边界 |
 | 2.8 | `src/types/message.ts` | 消息类型系统：AssistantMessage、UserMessage、ToolUse、ToolResult 等定义 |
+
+### 2.1 `query.ts` 函数调用路线
+
+```
+query(params)
+  └─ queryLoop(params, consumedCommandUuids)       // 真正的循环体
+       ├─ buildQueryConfig()                        // 快照不可变配置
+       ├─ [每轮迭代循环]
+       │    ├─ [compaction 检查分支]
+       │    │    ├─ autoCompact / reactiveCompact    // token 超限 → 触发压缩
+       │    │    ├─ buildPostCompactMessages()       // 压缩后重建消息
+       │    │    └─ contextCollapse                  // 折叠中间 tool 调用
+       │    ├─ normalizeMessagesForAPI()             // 标准化消息发往 API
+       │    ├─ [Anthropic API 流式请求]
+       │    │    └─ yield* streamAssistantMessage()  // SSE 解析 tool_use / text
+       │    ├─ [tool_use 分发]
+       │    │    ├─ findToolByName()                 // 匹配工具
+       │    │    ├─ canUseTool()                     // 权限检查（见第九阶段）
+       │    │    ├─ yield* tool.call()               // 执行工具（async generator）
+       │    │    └─ 结果注入 messages[]
+       │    ├─ transitions 状态机切换                // plan ↔ auto ↔ default
+       │    └─ budgetTracker / tokenBudget           // token 预算 & continue
+       └─ return terminal                            // 循环结束，返回最终状态
+```
+
+### 2.2 `QueryEngine.ts` 函数调用路线
+
+```
+QueryEngine 构造函数(config)
+  ├─ mutableMessages[], abortController, readFileState
+
+QueryEngine.submitMessage(prompt) — async generator, 核心入口
+  ├─ wrappedCanUseTool()                 // 包装 canUseTool, 记录 SDK 权限拒绝
+  ├─ fetchSystemPromptParts()            // → context.ts: getSystemContext()
+  ├─ processUserInput()                  // 解析用户输入(命令/skill/文本)
+  ├─ [replayUserMessages 模式]           // SDK 多轮重放
+  ├─ [每轮对话迭代]
+  │    ├─ query()                        // → query.ts 核心循环
+  │    ├─ [tool_use 后处理]
+  │    │    ├─ SyntheticOutputTool        // 结构化输出强制
+  │    │    └─ messageSelector            // SDK 消息过滤
+  │    ├─ [compaction 决策]
+  │    │    ├─ autoCompact()              // token 阈值检测
+  │    │    └─ reactiveCompact()          // 自适应压缩
+  │    └─ setAppState()                  // 更新 UI 状态
+  ├─ [orphanedPermission 回放]           // 处理上一轮遗留权限
+  └─ yield SDKMessage / SDKStatus        // SDK 兼容输出
+```
 
 > **前置知识**
 > - 第一阶段全部内容
@@ -117,6 +207,33 @@ graph TD
 | 3.10 | `src/tools/MCPTool/` | MCP 协议工具代理（将外部 MCP server 的工具映射为本地 tool） |
 
 > 后续阶段的 AgentTool、SkillTool、TaskCreateTool、SendMessageTool 等也都是工具，在各自阶段详述。
+
+### 3.3 `BashTool.tsx` 函数调用路线
+
+```
+BashTool 类 (extends Tool)
+  ├─ prompt()                  // 生成发送给模型的 tool 描述
+  ├─ description()             // 简短展示用描述
+  ├─ isReadOnly(input)         // 判断是否只读命令(免权限)
+  ├─ isSearchOrReadCommand()   // 搜索/读取类命令检测
+  ├─ validateInput(input)      // 命令合法性校验
+  ├─ checkPermissions(input)   // 权限检查入口
+  │    ├─ bashPermissions       // 路径白名单/黑名单
+  │    ├─ bashSecurity          // 安全规则(危险命令拦截)
+  │    ├─ modeValidation        // 权限模式验证
+  │    ├─ pathValidation        // 工作目录路径校验
+  │    ├─ readOnlyValidation    // 只读约束验证
+  │    └─ destructiveCommandWarning  // 破坏性命令警告
+  └─ call(input, ctx)          // **核心执行** (async generator)
+       ├─ shouldUseSandbox()   // 决定是否用沙箱
+       ├─ [进程启动]            // child_process.spawn / PTY
+       ├─ [实时输出流]          // onProgress 回调逐行输出
+       ├─ trackGitOperations() // Git 操作追踪
+       ├─ [超时/后台化处理]     // 长命令自动转入后台
+       │    └─ startBackgrounding() → backgroundFn(shellId)
+       ├─ sedEditParser        // sed 命令 → FileEdit 转换
+       └─ mapToolResultToToolResultBlockParam()  // 结果标准化
+```
 
 > **前置知识**
 > - 第一阶段（`Tool.ts` 基类依赖 `bootstrap/state.ts`）
@@ -166,6 +283,31 @@ graph TD
 
 > 其余文件（`cachedMCConfig`、`timeBasedMCConfig`、`compactWarning*`、`postCompactCleanup`、`sessionMemoryCompact`）是辅助配置/清理/钩子，通读核心 7 个后按需翻阅即可。
 
+### 5.1 `compact.ts` 函数调用路线
+
+```
+compactConversation(messages, ...) → CompactionResult   // **压缩入口**
+  ├─ grouping: 将连续 tool_use+tool_result 分组
+  ├─ streamCompactSummary()                             // 调模型生成摘要
+  │    └─ createCompactCanUseTool()                     // 压缩期间的受限权限
+  ├─ stripImagesFromMessages()                          // 移除图片节省 token
+  ├─ mergeHookInstructions()                            // 合并 hook 结果
+  └─ annotateBoundaryWithPreservedSegment()             // 标记压缩边界
+
+buildPostCompactMessages(result) → Message[]            // **重建消息**
+  ├─ createPostCompactFileAttachments()                 // 重新附加关键文件内容
+  │    ├─ collectReadToolFilePaths()                    // 收集被读过的重要文件
+  │    └─ shouldExcludeFromPostCompactRestore()         // 过滤不需要恢复的文件
+  ├─ createSkillAttachmentIfNeeded()                    // 恢复 skill 上下文
+  ├─ createPlanAttachmentIfNeeded()                     // plan mode 附件恢复
+  └─ createAsyncAgentAttachmentsIfNeeded()              // 异步 agent 状态恢复
+
+辅助函数:
+  truncateHeadForPTLRetry()   — prompt too long 时裁剪开头
+  stripReinjectedAttachments() — 去重重复附件
+  truncateToTokens()          — 按 token 限制截断内容
+```
+
 > **前置知识**
 > - 第二阶段（compact 在 `query()` 的 token 超限分支中触发）
 > - token 计数原理（tiktoken / `roughTokenCountEstimation`）
@@ -189,6 +331,32 @@ graph TD
 | 6A.6 | `src/utils/forkedAgent.ts` | Forked agent 上下文工具：createSubagentContext |
 
 > 其余（agentColorManager、agentDisplay、agentMemory、resumeAgent、loadAgentsDir、UI、buddy/）是 UI/配置/恢复辅助，核心知道后按需翻阅。
+
+### 6A.2 `runAgent.ts` 函数调用路线
+
+```
+runAgent({...}) — async generator, 子 Agent 生命周期
+  ├─ getAgentModel()                              // 解析 agent 使用的模型
+  ├─ createAgentId()                              // 生成唯一 agent ID
+  ├─ initializeAgentMcpServers()                  // MCP 服务器初始化
+  │    └─ connectToServer() + fetchToolsForClient()
+  ├─ forkSubagent() → createSubagentContext()     // fork 上下文(消息/状态/缓存)
+  ├─ getAgentSystemPrompt()                       // 构建 agent system prompt
+  │    └─ enhanceSystemPromptWithEnvDetails()
+  ├─ resolveAgentTools()                          // 解析 agent 可用工具集
+  ├─ registerFrontmatterHooks()                   // agent skill hooks 注册
+  ├─ executeSubagentStartHooks()                  // SessionStart hook 执行
+  ├─ [主对话循环]
+  │    ├─ query()                                 // → query.ts 核心循环
+  │    │    └─ filterIncompleteToolCalls()        // 过滤未完成 tool_use
+  │    └─ [消息后处理]
+  │         ├─ isRecordableMessage()              // 记录到 transcript
+  │         └─ cleanupAgentTracking()             // prompt cache 追踪
+  ├─ killShellTasksForAgent()                     // 清理后台 shell 任务
+  ├─ clearSessionHooks()                          // 清理 session hooks
+  ├─ clearInvokedSkillsForAgent()                 // 清理 invoked skills
+  └─ yield [摘要/结果]                             // 返回给父 session
+```
 
 > **前置知识（6A）**
 > - 第二阶段（runAgent 内部调用 `query()` 形成子循环）
@@ -253,6 +421,26 @@ graph TD
 
 > 其余 bridge 文件（envLessBridgeConfig、capacityWake、bridgeApi、bridgeConfig、bridgeEnabled、codeSessionApi、replBridge、webhookSanitizer）是具体配置/辅助，通读核心 6 个后按需翻阅。
 
+### 8.3 `sessionRunner.ts` 子进程生命周期
+
+```
+SessionSpawner 类 (createSessionSpawner)
+  ├─ spawn(opts)                                  // spawn 子 CLI 进程
+  │    ├─ safeFilenameId()                        // 文件名安全化
+  │    ├─ child_process.spawn(execPath, args)
+  │    │    └─ stdio: ['pipe', 'pipe', 'pipe']    // 三管道
+  │    ├─ createInterface(stdout)                 // 逐行读取 JSON
+  │    └─ stderr 监听 → 调试日志
+  ├─ [消息循环]
+  │    ├─ onActivity(sessionId, activity)         // 子进程状态变更
+  │    │    └─ TOOL_VERBS 映射 (Read→Reading, Bash→Running...)
+  │    └─ onPermissionRequest(sessionId, req)     // 权限请求转发
+  │         └─ control_request → PermissionDialog (父进程 UI)
+  └─ [生命周期]
+       ├─ session.done / session.abort            // 正常/异常结束
+       └─ cleanup: kill() + 删除临时文件
+```
+
 > **前置知识**
 > - 第六阶段（worktree 是 agent 的隔离执行环境）
 > - Git worktree 原理（`git worktree add`、`git worktree remove`、shared `.git`）
@@ -276,6 +464,26 @@ graph TD
 | 9.8 | `src/services/remoteManagedSettings/` | IT 管理员远程推送的权限策略 |
 
 **5 层权限链**：`policyLimits` → `remoteManagedSettings` → `permissions/rules/` → `PermissionContext`(session mode) → `PermissionDialog`(实时确认)
+
+### 9.1 `useCanUseTool.tsx` 函数调用路线
+
+```
+useCanUseTool(setToolUseConfirmQueue, setToolPermissionContext)
+  └─ 返回 canUseTool(tool, input, ctx, msg, toolUseID, forceDecision)
+       ├─ [1] permissionMode === 'bypassPermissions'  → allow (跳过全部)
+       ├─ [2] permissionMode === 'plan' && !force      → ask (计划模式)
+       ├─ [3] tool.isReadOnly?()                       → allow (只读免问)
+       ├─ [4] permission rules 匹配
+       │    ├─ 匹配 allow rule                         → allow
+       │    └─ 匹配 deny rule                          → deny
+       ├─ [5] policyLimits 检查                        → deny (硬约束)
+       ├─ [6] permissionMode === 'acceptEdits'
+       │    └─ tool 是 Edit/Write/NotebookEdit         → allow
+       ├─ [7] permissionMode === 'dontAsk'             → allow
+       ├─ [8] 推送 PermissionRequest 到 UI 队列
+       │    └─ PermissionDialog 渲染 → 用户确认/拒绝
+       └─ 返回 { behavior: 'allow'|'deny', updatedInput?, ... }
+```
 
 > **前置知识**
 > - 第三阶段（每个 Tool 的 `call()` 前触发 `canUseTool` 检查）
