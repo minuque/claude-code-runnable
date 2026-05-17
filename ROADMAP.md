@@ -8,50 +8,200 @@
 
 ---
 
-## 附录 A: 模块依赖关系图
+## 附录 A: 详细架构图
 
 ```mermaid
-graph TD
-    bootstrap[第一阶段: bootstrap/state.ts] --> agentLoop[第二阶段: query.ts]
-    bootstrap --> tools[第三阶段: Tool.ts + tools.ts]
+graph TB
+    %% ═══════ 样式定义 ═══════
+    classDef entry    fill:#d0ebff,stroke:#1971c2,stroke-width:2px
+    classDef query    fill:#e5dbff,stroke:#5f3dc4,stroke-width:2px
+    classDef tool     fill:#ffe3e3,stroke:#c92a2a,stroke-width:2px
+    classDef skill    fill:#fff4e6,stroke:#e67700,stroke-width:2px
+    classDef compact  fill:#f3d9fa,stroke:#862e9c,stroke-width:2px
+    classDef agent    fill:#ffe8cc,stroke:#d9480f,stroke-width:2px
+    classDef task     fill:#ffd8a8,stroke:#e8590c,stroke-width:2px
+    classDef team     fill:#c5f6fa,stroke:#0c8599,stroke-width:2px
+    classDef work     fill:#d3f9d8,stroke:#2f9e44,stroke-width:2px
+    classDef perm     fill:#ffc9c9,stroke:#e03131,stroke-width:2px
+    classDef mem      fill:#e7f5ff,stroke:#1c7ed6,stroke-width:2px
+    classDef svc      fill:#f8f9fa,stroke:#868e96,stroke-width:2px
 
-    tools --> skills[第四阶段: skills/]
-    tools --> permissions[第九阶段: permissions/]
+    %% ═══════ Entry & Bootstrap ═══════
+    subgraph bootstrap["第一阶段: 启动引导"]
+        main["main.tsx\nCLI入口+参数解析"]:::entry
+        state["bootstrap/state.ts\n全局单例状态"]:::entry
+        inits["entrypoints/init.ts\n配置/认证/遥测"]:::entry
+        ctx["context.ts\ngetSystemContext()"]:::entry
+        main --> inits
+        main --> state
+        inits --> state
+    end
 
-    agentLoop --> compact[第五阶段: compact/]
-    agentLoop --> subAgent[第六阶段: AgentTool/]
-    agentLoop --> autoMode[第十阶段: auto mode]
+    %% ═══════ Core Query Loop ═══════
+    subgraph queryloop["第二阶段: Agent Loop"]
+        qe["QueryEngine.ts\nsubmitMessage()"]:::query
+        qy["query.ts\nquery() -> queryLoop()"]:::query
+        api["services/api/\nAnthropic Messages流式请求"]:::query
+        promptDef["constants/prompts.ts\nDEFAULT_AGENT_PROMPT"]:::query
+        msgs["types/message.ts\n消息类型系统"]:::query
+        trans["query/transitions.ts\nplan/auto/default状态机"]:::query
+        budget["query/tokenBudget.ts\nToken预算管理"]:::query
+        qe --> qy
+        qe --> api
+        qy --> api
+        qy --> trans
+        qy --> budget
+        qe --> msgs
+    end
 
-    subAgent --> tasks[第六阶段: tasks/]
-    subAgent --> teamCoord[第七阶段: coordinator/]
-    subAgent --> worktree[第八阶段: worktree/]
+    %% ═══════ Tool System ═══════
+    subgraph toolsys["第三阶段: 工具系统"]
+        toolBase["Tool.ts\n基类抽象"]:::tool
+        toolReg["tools.ts\ngetTools()注册表"]:::tool
+        bashTool["BashTool.tsx\n沙箱/PTY/后台化"]:::tool
+        fileTools["FileRead/Edit/Write\n文件操作三件套"]:::tool
+        searchTools["GlobTool/GrepTool\n文件+内容搜索"]:::tool
+        webTools["WebFetch/WebSearch\n网络工具"]:::tool
+        mcpTool["MCPTool\n外部MCP代理"]:::tool
+        toolBase --> toolReg
+        toolReg --> bashTool
+        toolReg --> fileTools
+        toolReg --> searchTools
+        toolReg --> webTools
+        toolReg --> mcpTool
+    end
 
-    worktree --> bridge[第八阶段: bridge/]
-    teamCoord --> mailbox[第七阶段: SendMessage/]
+    %% ═══════ Skill Loading ═══════
+    subgraph skillsys["第四阶段: Skill加载"]
+        loadSkills["loadSkillsDir.ts\ngetSkillDirCommands()"]:::skill
+        skillTool["SkillTool\n模型调用入口"]:::skill
+        cmds["commands.ts\n斜杠命令注册表"]:::skill
+        mcpSkills["mcpSkills.ts\nMCP->Skill转换"]:::skill
+        loadSkills --> skillTool
+        cmds --> skillTool
+        mcpSkills --> skillTool
+    end
 
-    permissions --> tools
-    skills --> agentLoop
-    compact --> agentLoop
-    plugins[第十阶段: plugins/] --> tools
-    plugins --> skills
+    %% ═══════ Compaction ═══════
+    subgraph compactsys["第五阶段: 上下文压缩"]
+        compCore["compact.ts\ncompactConversation()"]:::compact
+        autoComp["autoCompact.ts\nToken阈值触发"]:::compact
+        microComp["microCompact.ts\n微压缩策略"]:::compact
+        snipComp["snipCompact+Projection\n裁剪压缩"]:::compact
+        grouping["grouping.ts\n消息分组"]:::compact
+        ctxCollapse["contextCollapse/\n上下文折叠"]:::compact
+        compCore --> autoComp
+        compCore --> microComp
+        compCore --> snipComp
+        compCore --> grouping
+        compCore --> ctxCollapse
+    end
+
+    %% ═══════ SubAgent ═══════
+    subgraph agentsys["第六A阶段: 子Agent派生"]
+        runAgent["runAgent.ts\n子Agent生命周期"]:::agent
+        forkAG["forkSubagent.ts\n上下文Fork"]:::agent
+        agentPrompt["prompt.ts\nAgent SystemPrompt"]:::agent
+        builtIn["builtInAgents.ts\n内置Agent类型"]:::agent
+        runAgent --> forkAG
+        runAgent --> agentPrompt
+        runAgent --> builtIn
+    end
+
+    %% ═══════ Task System ═══════
+    subgraph tasksys["第六B阶段: 任务系统"]
+        taskTypes["tasks/types.ts\nTaskState依赖图"]:::task
+        localAgent["LocalAgentTask.tsx\n核心任务生命周期"]:::task
+        taskTools["TaskCreate+List+Update\n任务工具链"]:::task
+        taskTypes --> localAgent
+        taskTools --> localAgent
+    end
+
+    %% ═══════ Team Coordination ═══════
+    subgraph teamsys["第七阶段: 团队协调"]
+        coord["coordinatorMode.ts\n协调者分发/汇总"]:::team
+        sendMsg["SendMessageTool.ts\n异步邮箱路由"]:::team
+        mailbox["context/mailbox.tsx\n邮箱Context"]:::team
+        teamCreate["TeamCreateTool\n团队定义"]:::team
+        coord --> sendMsg
+        teamCreate --> sendMsg
+        sendMsg --> mailbox
+    end
+
+    %% ═══════ Worktree & Bridge ═══════
+    subgraph worksys["第八阶段: Worktree隔离"]
+        enterWT["EnterWorktreeTool\ngit worktree创建"]:::work
+        exitWT["ExitWorktreeTool\n合并+清理"]:::work
+        sessRun["sessionRunner.ts\nSessionSpawner"]:::work
+        bridgeMain["bridgeMain.ts\nIPC进程间通信"]:::work
+        enterWT --> sessRun
+        sessRun --> bridgeMain
+        exitWT --> bridgeMain
+    end
+
+    %% ═══════ Permission ═══════
+    subgraph permsys["第九阶段: 权限治理"]
+        canUse["useCanUseTool.tsx\n8步权限决策链"]:::perm
+        permCtx["PermissionContext.ts\n5种会话模式"]:::perm
+        permRules["permissions/rules/\n权限规则引擎"]:::perm
+        policyL["policyLimits/\n组织硬约束"]:::perm
+        remoteM["remoteManagedSettings/\n远程策略"]:::perm
+        policyL --> canUse
+        remoteM --> canUse
+        permRules --> canUse
+        permCtx --> canUse
+    end
+
+    %% ═══════ Memory ═══════
+    subgraph memsys["第十阶段: 记忆系统"]
+        memCore["memdir/memdir.ts\nloadMemoryPrompt()"]:::mem
+        memTypes["memoryTypes.ts\n4类记忆定义"]:::mem
+        memSearch["findRelevantMemories.ts\n检索+衰减"]:::mem
+        memCore --> memTypes
+        memCore --> memSearch
+    end
+
+    %% ═══════ Services ═══════
+    subgraph services["第十阶段: 支撑服务"]
+        mcpSvc["services/mcp/\nMCP客户端/服务端"]:::svc
+        lspSvc["services/lsp/\nLSP语言服务"]:::svc
+        oauthSvc["services/oauth/\nOAuth认证"]:::svc
+        analytics["services/analytics/\nGrowthBook+遥测"]:::svc
+        hooksSys["utils/hooks/\n生命周期Hook"]:::svc
+        pluginsSvc["plugins/ + services/plugins/\n插件系统"]:::svc
+    end
+
+    %% ═══════ 跨层依赖连线 ═══════
+    bootstrap --> queryloop
+    bootstrap --> toolsys
+    ctx --> promptDef
+    ctx --> memCore
+
+    qy --> toolsys
+    qy --> compactsys
+    qe --> ctx
+
+    toolsys --> skillsys
+    toolsys --> permsys
+    toolsys --> agentsys
+
+    compactsys -.->|"token超限触发"| qy
+
+    agentsys --> tasksys
+    agentsys --> teamsys
+    agentsys --> worksys
+
+    sendMsg --> localAgent
+    enterWT --> runAgent
+    canUse --> toolsys
+
+    memCore -.->|"每轮注入"| qe
+    pluginsSvc -.-> toolsys
+    pluginsSvc -.-> skillsys
+    mcpSvc -.-> mcpTool
+    hooksSys -.-> qy
 ```
 
-## 附录 B: 自建实现路线
-
-```
-1. CLI + Config (~500行)         → 能启动、读取配置、连接 API
-2. 简单 query loop (~800行)      → 用户输入 → API → 流式输出 → 文本显示
-3. 3 个基础工具 (~600行)         → Read + Write + Bash
-4. 权限确认 (~400行)             → 每个工具调用前请求用户确认
-5. skill 加载 (~400行)           → 扫描目录 → 解析 SKILL.md → 注入 system prompt
-6. 上下文压缩 (~500行)           → token 超限 → 摘要 → 替换
-7. 子 agent (~600行)             → AgentTool → 独立会话 → 返回结果
-8. 任务图 (~500行)               → TaskCreate → 依赖 → 并行执行
-9. 团队邮箱 (~400行)             → SendMessage → 消息队列 → 多 agent 协作
-10. worktree 隔离 (~600行)       → EnterWorktree → git worktree → 独立进程
-─────────────────────────────────────────────
-总计: ~5500 行核心逻辑（不含 UI）
-```
 
 ---
 
